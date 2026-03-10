@@ -5,10 +5,11 @@
 # 2) Run data selection functions to filter the data based on defined parameters
 # 3) Combine all selected data into one table for easier querying and analysis  
 # 4) Create ship routes data using SCgraph
+# 5) Create pipeline network based on selected emitters and ports using straight line (havensine) and Prim's algorithm (for clustering)
 #############################################################################################################
 
 from pathlib import Path
-from user_defined_function import etl_eea, etl_climate_trace, combine_emitters, etl_co2_storage, etl_port, select_emitters, select_co2_storage, select_ports, combine_all_selected, create_ship_routes
+from user_defined_function import create_pipeline_network, etl_eea, etl_climate_trace, combine_emitters, etl_co2_storage, etl_port, select_emitters, select_co2_storage, select_ports, combine_all_selected, create_ship_routes, create_pipeline_network
 
 ################### Define file paths and filter parameters ###################
 
@@ -16,17 +17,18 @@ from user_defined_function import etl_eea, etl_climate_trace, combine_emitters, 
 script_dir = Path(__file__).resolve().parent
 
 ## ----- Define file path -----
-raw_dir = script_dir / 'inputs' / 'raw'
+raw_dir = script_dir / 'raw'
 file_path_eea = str(raw_dir / 'EEA_CO2.xlsx')         # raw excel file (query from Industrial_dataset_v_15_2025_12_15.DB)
 file_path_climate_trace = str(raw_dir / 'climate_trace')   # folder with multiple raw csv files
 file_path_co2_storage = str(raw_dir / 'storage.xlsx')           # manual create excel file
 file_path_port = str(raw_dir / 'port.csv')                      # editted csv file from World Port Index
 file_path_area = str(raw_dir / 'Area_Boundary.geojson')         # manual create geojson file
+output_path_intermediate_result = str(script_dir / 'data_processed' / 'intermediate_output' / 'pipeline_network.xlsx')    #  export for manual checking
 
 ## ----- Define filter parameters -----
 selected_subsectors = ['steel', 'cement', 'waste']
 emission_cutoff = 200000   # tCO2 per year
-storage_cutoff = 15000000  # tCO2
+storage_cutoff = 15000000  # tCO2 
 
 
 
@@ -47,8 +49,10 @@ select_ports()
 combine_all_selected()
 
 ## ----- 4)  Create ship routes data using SCGraph ------
-create_ship_routes()
+create_ship_routes(output_path_intermediate_result)
 
+## ----- 5) Create pipeline network based on selected emitters and ports using straight line (havensine) and Prim's algorithm (for clustering)
+create_pipeline_network(output_path_intermediate_result)
 
 # Print the table name from database.duckdb
 import duckdb

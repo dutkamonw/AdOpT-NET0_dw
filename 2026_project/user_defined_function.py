@@ -1,13 +1,21 @@
 ########### This files contains user-defined functions, including: ##########
-### Note: these functions are called in 1_data_preprocessing.py ###
-# 1. ETL pipeline for the raw data into duckdb database
-# 2. Data selection for case study
-# 3. Combines all seleted emiiters, storage, and ports data
-# 4. Create shipping route based on selected ports
+### These functions are called in 1_data_preprocessing.py ###
+# 1. ETL pipeline for loading all cleaned data into duckdb database (EEA, Climate TRACE, CO2 storage, port)
+# 2. Data selection for 2026 project case study based on defined parameters (query from database.duckdb and filter in python)
+# 3. Combines all selected emitters, storage, and ports data into a single table
+# 4. Create shipping route based on selected ports by SCGraph's marnet geograph API
+# 5. (a) Calculate straight line distance based on haversine formula (the greatest circle distance)
+# 5. (b) Create pipeline network based on selected emitters and ports using straight line (haversine) and Prim's algorithm (for clustering)
+
+### These functions are called in 2_data_processing.py for model input ###
+# 6. Create N x N matrix from database
+# 7. Create NodeLocations.csv from database
 
 
+################################################################################
 
 import pandas as pd
+import numpy as np
 import duckdb
 from pyproj import Proj
 import glob
@@ -21,7 +29,7 @@ from scgraph.geographs.marnet import marnet_geograph
 # Database path relative to this module's location
 DB_PATH = str(Path(__file__).resolve().parent / 'database.duckdb')
 
-############ 1. ETL pipeline for loading the raw data into duckdb database ################
+############ 1. ETL pipeline for loading all cleaned data into duckdb database (EEA, Climate TRACE, CO2 storage, port) ################
 
 ## ----- Create mapping function to standardise subsector name (only interested sectors) -----
 def map_subsector(code):
@@ -50,7 +58,7 @@ def map_subsector(code):
     else:
         return None
 
-
+## ----- Create mapping function to standardise country name to iso2 -----
 def map_iso3_to_iso2(code):
     """Map ISO-3 country code to ISO-2, returning None for invalid/missing codes."""
     if pd.isna(code):
@@ -101,6 +109,8 @@ def map_country_to_iso2(country_value):
 
 ## ----- ETL for EEA data -----
 def etl_eea(file_path_eea):
+    """ETL process for EEA data: Extract, Transform, Load."""
+    
     # Import EEA excel file in raw folder
     eea = pd.read_excel(file_path_eea)
 
@@ -126,6 +136,7 @@ def etl_eea(file_path_eea):
 
 ## ----- ETL for Climate TRACE data -----
 def etl_climate_trace(file_path_climate_trace):
+    """ETL process for Climate TRACE data: Extract, Transform, Load."""
     # Import all Climate TRACE csv file in the folder
     climate_trace = glob.glob(file_path_climate_trace + "/*.csv")
     climate_trace = pd.concat((pd.read_csv(file, low_memory=False) for file in climate_trace), ignore_index=True)
@@ -157,6 +168,7 @@ def etl_climate_trace(file_path_climate_trace):
 
 ## ----- Combine all emitter data into one table for study -----
 def combine_emitters():
+    """Combine emitter data from EEA and Climate TRACE"""
     con = duckdb.connect(DB_PATH)
     combined = con.execute("SELECT name, iso2, latitude, longitude, year, emission_TPA, subsector, data_source FROM eea UNION ALL SELECT name, iso2, latitude, longitude, year, emission_TPA, subsector, data_source FROM climate_trace").fetchdf()
     con.register('emitters_all', combined)
@@ -166,6 +178,8 @@ def combine_emitters():
 
 ## ----- ETL for CO2 Storage data -----
 def etl_co2_storage(file_path_co2_storage):
+    """ETL process for CO2 Storage data: Extract, Transform, Load."""
+    
     # Import CO2 Storage excel file in raw folder
     co2_storage = pd.read_excel(file_path_co2_storage)
     
@@ -175,7 +189,7 @@ def etl_co2_storage(file_path_co2_storage):
     co2_storage['y'] = pd.to_numeric(co2_storage['y'], errors='coerce')
     co2_storage['TOTAL_CAPACITY_BASE_MT'] = pd.to_numeric(co2_storage['TOTAL_CAPACITY_BASE_MT'], errors='coerce')
     # Covert 'TOTAL_CAPACITY_BASE_MT' in MtCO2 to 'capacity' in tCO2
-    co2_storage['capacity'] = co2_storage['TOTAL_CAPACITY_BASE_MT'] * 1000000
+    co2_storage['capacity_T'] = co2_storage['TOTAL_CAPACITY_BASE_MT'] * 1000000
     # Convert x, y to latitude, longitude where needed
     mask = co2_storage['latitude'].isna() & co2_storage['EPSG'].notna() & co2_storage['x'].notna() & co2_storage['y'].notna()
     for idx in co2_storage[mask].index:
@@ -195,6 +209,7 @@ def etl_co2_storage(file_path_co2_storage):
 
 ## ----- ETL for port data -----
 def etl_port(file_path_port):
+    """ETL process for port data: Extract, Transform, Load."""
     # Import port excel file in raw folder
     port = pd.read_csv(file_path_port)
     
@@ -216,6 +231,7 @@ def etl_port(file_path_port):
 
 ## ----- Select emitters ------
 def select_emitters(file_path_area, emission_cutoff, selected_subsectors):
+    """Select emitters based on area, emission cutoff, and subsectors."""
     # Import area from geojson
     area = gpd.read_file(file_path_area)
     # Get data from emitters table
@@ -263,6 +279,7 @@ def select_emitters(file_path_area, emission_cutoff, selected_subsectors):
 
 ## ----- Select co2_storage ------
 def select_co2_storage(file_path_area, storage_cutoff):
+    """Select CO2 storage sites based on area and capacity cutoff. Need to define 'group' for clustering in raw file"""
     # Import area from geojson
     area = gpd.read_file(file_path_area)
     # Get data from co2_storage table 
@@ -272,7 +289,7 @@ def select_co2_storage(file_path_area, storage_cutoff):
 
     ### Filtering ###
     # Drop missing coordinate and capacity data
-    co2_storage = co2_storage.dropna(subset=['latitude', 'longitude', 'capacity'])
+    co2_storage = co2_storage.dropna(subset=['latitude', 'longitude', 'capacity_T'])
     # Clip data within area (spatial filter)
     co2_storage_gdf = gpd.GeoDataFrame(
         co2_storage, 
@@ -284,11 +301,11 @@ def select_co2_storage(file_path_area, storage_cutoff):
     # Clip data within area (spatial filter)
     co2_storage_selected = gpd.sjoin(co2_storage_gdf, area, how='inner', predicate='within')
     # Keep only storage with capacity >= storage_cutoff
-    co2_storage_selected = co2_storage_selected[co2_storage_selected['capacity'] >= storage_cutoff]
+    co2_storage_selected = co2_storage_selected[co2_storage_selected['capacity_T'] >= storage_cutoff]
     # Sum capacity by 'group' and keep other data from the row with largest capacity
-    co2_storage_selected = co2_storage_selected.sort_values('capacity', ascending=False)
-    agg_dict = {col: 'first' for col in co2_storage_selected.columns if col != 'capacity'}
-    agg_dict['capacity'] = 'sum'
+    co2_storage_selected = co2_storage_selected.sort_values('capacity_T', ascending=False)
+    agg_dict = {col: 'first' for col in co2_storage_selected.columns if col != 'capacity_T'}
+    agg_dict['capacity_T'] = 'sum'
     co2_storage_selected = co2_storage_selected.groupby('group', as_index=False).agg(agg_dict)
     
     ### Store the selected co2 storage data in database.duckdb, if exists, replace it ###
@@ -296,7 +313,7 @@ def select_co2_storage(file_path_area, storage_cutoff):
     co2_storage_selected_df = co2_storage_selected.drop(columns=['geometry', 'index_right'], errors='ignore').copy()
     co2_storage_selected_df['type'] = 'storage'
     # Keep only necessary columns
-    co2_storage_selected_df = co2_storage_selected_df[['group', 'name', 'iso2', 'latitude', 'longitude', 'capacity', 'type', 'data_source']]
+    co2_storage_selected_df = co2_storage_selected_df[['group', 'name', 'iso2', 'latitude', 'longitude', 'capacity_T', 'type', 'data_source']]
 
     con = duckdb.connect(DB_PATH)
     con.register('co2_storage_selected', co2_storage_selected_df)
@@ -305,6 +322,7 @@ def select_co2_storage(file_path_area, storage_cutoff):
 
 ## ----- Select ports ------
 def select_ports():
+    """Select ports based on 'selected' column."""
     con = duckdb.connect(DB_PATH)
     port = con.execute("SELECT * FROM port").fetchdf()
     con.close()
@@ -333,6 +351,7 @@ def select_ports():
 
 ############# 3. Combines all seleted emiiters, storage, and ports data #####################
 def combine_all_selected():
+    """Combine all selected emitters, storage, and ports data into one table"""
     con = duckdb.connect(DB_PATH)
     query = """
     SELECT
@@ -342,7 +361,7 @@ def combine_all_selected():
         latitude,
         longitude,
         emission_TPA,
-        CAST(NULL AS DOUBLE) AS capacity,
+        CAST(NULL AS DOUBLE) AS capacity_T,
         subsector,
         data_source,
         type,
@@ -357,7 +376,7 @@ def combine_all_selected():
         latitude,
         longitude,
         CAST(NULL AS DOUBLE) AS emission_TPA,
-        capacity,
+        capacity_T,
         CAST(NULL AS VARCHAR) AS subsector,
         data_source,
         type,
@@ -372,7 +391,7 @@ def combine_all_selected():
         latitude,
         longitude,
         CAST(NULL AS DOUBLE) AS emission_TPA,
-        CAST(NULL AS DOUBLE) AS capacity,
+        CAST(NULL AS DOUBLE) AS capacity_T,
         CAST(NULL AS VARCHAR) AS subsector,
         CAST(NULL AS VARCHAR) AS data_source,
         type,
@@ -387,7 +406,7 @@ def combine_all_selected():
     con.close()
 
 ############# 4. Create ship route data for selected ports #####################
-def create_ship_routes():
+def create_ship_routes(output_path):
     con = duckdb.connect(DB_PATH)
     # Get selected ports
     ports_selected = con.execute("SELECT * FROM combined_selected WHERE type = 'port'").fetchdf()
@@ -433,13 +452,300 @@ def create_ship_routes():
     # Prepare final table
     ship_routes = routes_df[['route_id', 'from', 'to', 'distance_km', 'geometry_wkt']].rename(
         columns={'from': 'from_port', 'to': 'to_port'})
+    # Export to 
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    ship_routes.to_excel(output_path, index=False)
+    
     # Load into database
     con.register('ship_routes', ship_routes)
     con.execute("CREATE OR REPLACE TABLE ship_routes AS SELECT * FROM ship_routes")
     con.close()
 
+############# 5. Create pipeline network for selected emitters and ports using straight line distance #####################
 
-############# 5. Create reusable square matrix from database table #####################
+## Function to calculate straight line distance based on haversine formula, which accounts for the curvature of the Earth. The distance is returned in kilometers.
+def distance(lat1, lon1, lat2, lon2):
+    """Calculate the great circle distance in kilometers between two points on the Earth specified in decimal degrees."""
+    lat1, lon1 = np.radians(lat1), np.radians(lon1)
+    lat2, lon2 = np.radians(lat2), np.radians(lon2)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 6371.0 * (2.0 * np.arcsin(np.sqrt(a)))  # kilometers
+
+
+## Function to create pipeline network
+def create_pipeline_network(output_path):
+    """
+    Build a CO2 pipeline network from combined_selected data.
+
+    Edge types produced:
+      emitter_to_emitter   – MST edges connecting emitters within the same cluster
+      emitter_to_port      – MST edges connecting an emitter directly to its cluster's loading port;
+                             every loading port (screening != 'sink') has at least one such edge
+      emitter_to_alternative – shortest cross-cluster emitter-emitter bridge, one per cluster pair
+      emitter_to_terminal  – emitter → sink port (screening == 'sink'); added for an emitter only
+                             when the terminal distance is shorter than its shortest other edge;
+                             every terminal gets at least one such edge
+      terminal_to_storage  – sink port → storage site (nearest terminal per storage)
+
+    Clustering: each emitter is assigned to its nearest loading port; Prim's MST is then run on the
+    combined set of {emitters in cluster} + {their loading port} so the MST naturally decides
+    whether each emitter connects directly to the port or chains through another emitter.
+    """
+    con = duckdb.connect(DB_PATH)
+    combined_selected = con.execute(
+        'SELECT name, type, latitude, longitude, screening FROM "combined_selected"'
+    ).fetchdf()
+
+    emitter  = combined_selected[combined_selected["type"] == "emitter"].reset_index(drop=True)
+    port_all = combined_selected[combined_selected["type"] == "port"].reset_index(drop=True)
+    storage  = combined_selected[combined_selected["type"] == "storage"].reset_index(drop=True)
+
+    # Loading ports (non-sink) vs. terminal ports (sink)
+    port = port_all[port_all["screening"] != "sink"].reset_index(drop=True)
+    sink = port_all[port_all["screening"] == "sink"].reset_index(drop=True)
+
+    emit_lat = emitter["latitude"].to_numpy()
+    emit_lon = emitter["longitude"].to_numpy()
+    port_lat = port["latitude"].to_numpy() if len(port) > 0 else np.array([])
+    port_lon = port["longitude"].to_numpy() if len(port) > 0 else np.array([])
+    sink_lat = sink["latitude"].to_numpy() if len(sink) > 0 else np.array([])
+    sink_lon = sink["longitude"].to_numpy() if len(sink) > 0 else np.array([])
+
+    cols = ["edge_type", "from_name", "from_latitude", "from_longitude",
+            "to_name", "to_latitude", "to_longitude", "distance_km"]
+
+    # ── Distance matrices ────────────────────────────────────────────────────
+    dist_ep = (distance(emit_lat[:, None], emit_lon[:, None], port_lat[None, :], port_lon[None, :])
+               if len(port) > 0 else np.empty((len(emitter), 0)))
+    dist_ee = distance(emit_lat[:, None], emit_lon[:, None], emit_lat[None, :], emit_lon[None, :])
+    dist_es = (distance(emit_lat[:, None], emit_lon[:, None], sink_lat[None, :], sink_lon[None, :])
+               if len(sink) > 0 else None)
+
+    # ── Cluster assignment: each emitter → index of nearest loading port ─────
+    b = dist_ep.argmin(axis=1) if len(port) > 0 else np.zeros(len(emitter), dtype=int)
+
+    # ── Prim's MST per cluster (emitters + their loading port) ───────────────
+    # Nodes 0..n_e-1 map to emit_indices; node n_e is the loading port.
+    # Starting from the port ensures the MST is rooted there, so the edges
+    # produced naturally represent CO2 flowing toward the port.
+    mst_rows = []
+
+    def _prim_cluster(emit_indices, p_idx):
+        # emit_indices: indices of emitters in the cluster (referring to rows in emitter DataFrame)
+        n_e = len(emit_indices)
+        n   = n_e + 1
+        # Prim's algorithm with adjacency matrix given by dist_ee for emitter-emitter edges and dist_ep for emitter-port edges
+        in_tree  = np.zeros(n, dtype=bool)
+        min_cost = np.full(n, np.inf)
+        parent   = np.full(n, -1, dtype=int)
+        min_cost[n_e] = 0.0  # root: loading port
+
+        for _ in range(n):
+            # pick cheapest not-yet-in-tree node
+            u = -1; best = np.inf
+            # Note: the port node (n_e) is included in this loop and can be picked when its min_cost is lowest. 
+            # Subsequent emitters will then connect either to the port or to other emitters based on the MST logic.
+            for v in range(n):
+                if not in_tree[v] and min_cost[v] < best:
+                    best, u = min_cost[v], v
+            if u == -1:
+                break
+            in_tree[u] = True
+            # add edge (parent[u], u) to MST result, if u is not the root
+            if parent[u] != -1:
+                pu = parent[u]
+                if u < n_e and pu < n_e:
+                    # emitter–emitter edge
+                    i, j = emit_indices[u], emit_indices[pu]
+                    mst_rows.append({
+                        "edge_type":      "emitter_to_emitter",
+                        "from_name":      emitter.iloc[i]["name"],
+                        "from_latitude":  emit_lat[i], "from_longitude": emit_lon[i],
+                        "to_name":        emitter.iloc[j]["name"],
+                        "to_latitude":    emit_lat[j], "to_longitude":   emit_lon[j],
+                        "distance_km":    dist_ee[i, j],
+                    })
+                else:
+                    # emitter–port edge (one of u/pu is n_e, the other is an emitter)
+                    ei = emit_indices[u] if u < n_e else emit_indices[pu]
+                    mst_rows.append({
+                        "edge_type":      "emitter_to_port",
+                        "from_name":      emitter.iloc[ei]["name"],
+                        "from_latitude":  emit_lat[ei], "from_longitude": emit_lon[ei],
+                        "to_name":        port.iloc[p_idx]["name"],
+                        "to_latitude":    port_lat[p_idx], "to_longitude":   port_lon[p_idx],
+                        "distance_km":    dist_ep[ei, p_idx],
+                    })
+
+            # relax edges from u
+            for v in range(n):
+                # Skip if already in tree or if u and v are both the port node (no self-loop)
+                if in_tree[v]:
+                    continue
+                # Determine cost of edge (u, v) based on whether u and v are emitters or the port
+                if u < n_e and v < n_e:
+                    cost = dist_ee[emit_indices[u], emit_indices[v]]
+                # One of u/v is the port node (n_e) and the other is an emitter: cost from dist_ep
+                elif u < n_e and v == n_e:
+                    cost = dist_ep[emit_indices[u], p_idx]
+                # The case of u == n_e and v == n_e is not valid (no self-loop on port)
+                elif u == n_e and v < n_e:
+                    cost = dist_ep[emit_indices[v], p_idx]
+                else:
+                    continue
+                # Relax edge (u, v) if cost is lower
+                if cost < min_cost[v]:
+                    min_cost[v] = cost
+                    parent[v] = u
+    # Run Prim's MST for each cluster
+    if len(port) > 0:
+        for cid in range(len(port)):
+            # Find emitters in this cluster (those whose nearest port is cid)
+            members = np.where(b == cid)[0].tolist()
+            # If no emitters are assigned to this port, connect the port directly to its closest emitter (even though it's not in the same cluster by the nearest-port rule).
+            if len(members) == 0:
+                # Port has no emitters cluster-assigned: connect its closest emitter directly
+                e_idx = int(dist_ep[:, cid].argmin())
+                mst_rows.append({
+                    "edge_type":      "emitter_to_port",
+                    "from_name":      emitter.iloc[e_idx]["name"],
+                    "from_latitude":  emit_lat[e_idx], "from_longitude": emit_lon[e_idx],
+                    "to_name":        port.iloc[cid]["name"],
+                    "to_latitude":    port_lat[cid], "to_longitude":   port_lon[cid],
+                    "distance_km":    dist_ep[e_idx, cid],
+                })
+            else:
+                _prim_cluster(members, cid)
+
+    mst_df             = pd.DataFrame(mst_rows, columns=cols) if mst_rows else pd.DataFrame(columns=cols)
+    emitter_to_port    = mst_df[mst_df["edge_type"] == "emitter_to_port"].reset_index(drop=True)
+    emitter_to_emitter = mst_df[mst_df["edge_type"] == "emitter_to_emitter"].reset_index(drop=True)
+
+    # ── emitter_to_alternative: one bridge per cluster pair (shortest) ───────
+    alt_candidates = []
+    seen_pairs = set()
+    for i in range(len(emitter)):
+        # Find emitters in different clusters (b) and calculate distance to them using dist_ee; pick the closest one as alternative edge candidate for this emitter.
+        other = np.where(b != b[i])[0]
+        if len(other) == 0:
+            continue
+        # Pick the closest emitter in a different cluster as alternative edge candidate
+        j = int(other[dist_ee[i, other].argmin()])
+        key = (min(i, j), max(i, j))
+        # Add this pair as an alternative edge candidate if we haven't already added an alternative edge for this cluster pair.
+        # The seen_pairs set ensures we only add one alternative edge per cluster pair, even if multiple emitters in the same cluster have the same closest emitter in the other cluster.
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            alt_candidates.append({
+                "edge_type":      "emitter_to_alternative",
+                "from_name":      emitter.iloc[i]["name"],
+                "from_latitude":  emit_lat[i], "from_longitude": emit_lon[i],
+                "to_name":        emitter.iloc[j]["name"],
+                "to_latitude":    emit_lat[j], "to_longitude":   emit_lon[j],
+                "distance_km":    dist_ee[i, j],
+                "_from_cluster":  int(b[i]),
+                "_to_cluster":    int(b[j]),
+            })
+    # Among the candidate alternative edges, keep only the shortest one per cluster pair to avoid redundancy.
+    if alt_candidates:
+        alt_df = pd.DataFrame(alt_candidates)
+        alt_df["_cluster_pair"] = alt_df.apply(
+            lambda r: (min(r["_from_cluster"], r["_to_cluster"]),
+                       max(r["_from_cluster"], r["_to_cluster"])), axis=1
+        )
+        alt_df = alt_df.loc[alt_df.groupby("_cluster_pair")["distance_km"].idxmin()]
+        emitter_to_alt = alt_df[cols].reset_index(drop=True)
+    else:
+        emitter_to_alt = pd.DataFrame(columns=cols)
+
+    # ── emitter_to_terminal: emitter → nearest sink port ─────────────────────
+    # Rule: add only when d(emitter→terminal) < emitter's shortest other edge.
+    # Guarantee: every terminal (sink port) has at least one emitter_to_terminal.
+    emitter_to_terminal = pd.DataFrame(columns=cols)
+    if len(sink) > 0 and dist_es is not None:
+        # Per-emitter minimum distance across all edges built so far
+        all_other = pd.concat([emitter_to_port, emitter_to_emitter, emitter_to_alt], ignore_index=True)
+        from_min = all_other.groupby("from_name")["distance_km"].min()
+        to_min   = all_other.groupby("to_name")["distance_km"].min()
+        # For each emitter, find the nearest terminal and compare the distance to that terminal with the emitter's shortest other edge.
+        # If the terminal is closer, add an edge from the emitter to that terminal.
+        term_rows = []
+        for e_idx in range(len(emitter)):
+            e_name = emitter.iloc[e_idx]["name"]
+            s_idx  = int(dist_es[e_idx].argmin())
+            d_term = dist_es[e_idx, s_idx]
+            d_other = min(from_min.get(e_name, np.inf), to_min.get(e_name, np.inf))
+            if d_term < d_other:
+                term_rows.append({
+                    "edge_type":      "emitter_to_terminal",
+                    "from_name":      e_name,
+                    "from_latitude":  emit_lat[e_idx], "from_longitude": emit_lon[e_idx],
+                    "to_name":        sink.iloc[s_idx]["name"],
+                    "to_latitude":    sink_lat[s_idx], "to_longitude":   sink_lon[s_idx],
+                    "distance_km":    d_term,
+                })
+        emitter_to_terminal = pd.DataFrame(term_rows, columns=cols) if term_rows else pd.DataFrame(columns=cols)
+
+        # Guarantee every terminal has at least one emitter_to_terminal
+        covered = set(emitter_to_terminal["to_name"]) if not emitter_to_terminal.empty else set()
+        for s_idx in range(len(sink)):
+            if sink.iloc[s_idx]["name"] not in covered:
+                e_idx = int(dist_es[:, s_idx].argmin())
+                emitter_to_terminal = pd.concat([emitter_to_terminal, pd.DataFrame([{
+                    "edge_type":      "emitter_to_terminal",
+                    "from_name":      emitter.iloc[e_idx]["name"],
+                    "from_latitude":  emit_lat[e_idx], "from_longitude": emit_lon[e_idx],
+                    "to_name":        sink.iloc[s_idx]["name"],
+                    "to_latitude":    sink_lat[s_idx], "to_longitude":   sink_lon[s_idx],
+                    "distance_km":    dist_es[e_idx, s_idx],
+                }])], ignore_index=True)
+
+    # ── terminal_to_storage: nearest terminal → each storage site ────────────
+    terminal_to_storage = pd.DataFrame(columns=cols)
+    if len(sink) > 0 and len(storage) > 0:
+        stor_lat  = storage["latitude"].to_numpy()
+        stor_lon  = storage["longitude"].to_numpy()
+        dist_stor = distance(stor_lat[:, None], stor_lon[:, None], sink_lat[None, :], sink_lon[None, :])
+        ts = []
+        for st_idx in range(len(storage)):
+            sk_idx = int(dist_stor[st_idx].argmin())
+            ts.append({
+                "edge_type":      "terminal_to_storage",
+                "from_name":      sink.iloc[sk_idx]["name"],
+                "from_latitude":  sink_lat[sk_idx], "from_longitude": sink_lon[sk_idx],
+                "to_name":        storage.iloc[st_idx]["name"],
+                "to_latitude":    stor_lat[st_idx], "to_longitude":   stor_lon[st_idx],
+                "distance_km":    dist_stor[st_idx, sk_idx],
+            })
+        terminal_to_storage = pd.DataFrame(ts, columns=cols)
+
+    # ── Combine & save ────────────────────────────────────────────────────────
+    pipeline_network = pd.concat(
+        [emitter_to_port, emitter_to_emitter, emitter_to_alt,
+         emitter_to_terminal, terminal_to_storage],
+        ignore_index=True
+    )
+
+    # Make sure all distance_km are numeric
+    pipeline_network['distance_km'] = pd.to_numeric(pipeline_network['distance_km'], errors='coerce')
+
+    # Fill 0 for 'from_name' == 'to_name'
+    same_name_mask = pipeline_network["from_name"] == pipeline_network["to_name"]
+    pipeline_network.loc[same_name_mask, "distance_km"] = 0.0
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    pipeline_network.to_excel(output_path, index=False)
+
+    con.register('pipeline_network', pipeline_network)
+    con.execute("CREATE OR REPLACE TABLE pipeline_network AS SELECT * FROM pipeline_network")
+    con.close()
+
+    return pipeline_network
+
+
+
+############# 6. Create reusable N x N matrix from database table #####################
 def create_matrix(table_name, col_start, col_end, value, output_path):
     # Quote identifiers so custom table/column names work safely.
     def _q(identifier):
@@ -455,24 +761,57 @@ def create_matrix(table_name, col_start, col_end, value, output_path):
     con = duckdb.connect(DB_PATH)
     data = con.execute(query).fetchdf()
     con.close()
-
+    # Convert cell_value to numeric, coercing errors to NaN to handle any non-numeric entries.
+    data['cell_value'] = pd.to_numeric(data['cell_value'], errors='coerce')
+    
     data = data.dropna(subset=['node_start', 'node_end'])
 
     nodes = sorted(set(data['node_start']).union(set(data['node_end'])))
     matrix = pd.DataFrame(index=nodes, columns=nodes)
 
+    # Fill the matrix with values from the data; missing entries will remain NaN for now.
     for row in data.itertuples(index=False):
         matrix.at[row.node_start, row.node_end] = row.cell_value
-
+    # Set diagonal to 0 (distance from a node to itself is zero); this also ensures any nodes that only appear as start or end are included in the matrix.
     for node in nodes:
         matrix.at[node, node] = 0
-
+    # Fill any remaining NaN values with 0
     matrix = matrix.fillna(0)
+
+    # Ensure all matrix values are numeric
+    matrix = matrix.astype(float)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     matrix.to_csv(output_path, index_label="NODE")
 
     return matrix
+
+
+############# 7. Create NodeLocations.csv from combined_selected #####################
+def create_node_location(type, altitude):
+    con = duckdb.connect(DB_PATH)
+    nodes = con.execute("SELECT name, type, longitude, latitude FROM combined_selected").fetchdf()
+    con.close()
+
+    # Support one type (e.g., 'port') or multiple types (e.g., ['port', 'storage']).
+    if isinstance(type, (list, tuple, set)):
+        selected = nodes[nodes['type'].isin(type)]
+    else:
+        selected = nodes[nodes['type'].astype(str).str.contains(str(type), case=False, na=False)]
+
+    node_locations = selected[['name', 'longitude', 'latitude']]
+    node_locations.rename(columns={'longitude': 'lon', 'latitude': 'lat'}, inplace=True)
+    node_locations['alt'] = altitude
+    node_locations = node_locations.drop_duplicates(subset=['name'])
+    node_locations = node_locations.set_index('name')
+
+    output_path = Path(__file__).resolve().parent / 'inputs' / 'NodeLocations.csv'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Match expected model format: ;lon;lat;alt with node names in first column.
+    node_locations.to_csv(output_path, sep=';', index=True, index_label='')
+
+    return node_locations
+
 
 
 
