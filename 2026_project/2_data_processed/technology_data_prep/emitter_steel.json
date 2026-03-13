@@ -1,0 +1,48 @@
+{
+  "tec_type": "CONV4",
+  "comment": "This file is auto-generated from user input in excel file.",
+  "size_min": 0,
+  "size_max": 10000,
+  "size_is_int": 0,
+  "size_based_on": "output",
+  "decommission": 0,
+  "Economics": {
+    "capex_model": 1,
+    "unit_capex": 0,
+    "opex_variable": 0,
+    "opex_fixed": 0,
+    "discount_rate": 0.1,
+    "lifetime": 25,
+    "decommission_cost": 0
+  },
+  "Performance": {
+    "performance_function_type": 1,
+    "main_output_carrier": "steel",
+    "output_carrier": [
+      "steel"
+    ],
+    "output_ratios": {},
+    "emission_factor": 1,
+    "min_part_load": 0,
+    "ccs": {
+      "possible": 1,
+      "co2_concentration": 0.15,
+      "ccs_type": "MEA_large"
+    },
+    "ramping_rate": -1,
+    "standby_power": -1,
+    "min_uptime": -1,
+    "min_downtime": -1,
+    "SU_time": -1,
+    "SD_time": -1,
+    "SU_load": -1,
+    "SD_load": -1,
+    "max_startups": -1
+  },
+  "Units": {
+    "size": "t/h",
+    "output_carrier": {
+      "CO2captured": "t/h"
+    }
+  }
+}

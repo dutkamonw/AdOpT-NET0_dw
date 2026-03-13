@@ -1,5 +1,6 @@
 ########### This files contains user-defined functions, including: ##########
-### These functions are called in 1_data_preprocessing.py ###
+
+### The functions are called in 1_data_preprocessing.py: ###
 # 1. ETL pipeline for loading all cleaned data into duckdb database (EEA, Climate TRACE, CO2 storage, port)
 # 2. Data selection for 2026 project case study based on defined parameters (query from database.duckdb and filter in python)
 # 3. Combines all selected emitters, storage, and ports data into a single table
@@ -7,13 +8,16 @@
 # 5. (a) Calculate straight line distance based on haversine formula (the greatest circle distance)
 # 5. (b) Create pipeline network based on selected emitters and ports using straight line (haversine) and Prim's algorithm (for clustering)
 
-### These functions are called in 2_data_processing.py for model input ###
+### The functions are called in 2_data_processing.py for model input: ###
 # 6. Create N x N matrix from database
 # 7. Create NodeLocations.csv from database
-
+# 8. Copy technology JSON files from adopt-net0 database
+# 9. Create technology JSON files for emitters based on Excel config (if needed, not in current scope)
+# 10. Copy network data JSON files from adopt-net0 database
 
 ################################################################################
 
+import csv
 import pandas as pd
 import numpy as np
 import duckdb
@@ -25,6 +29,7 @@ import geopandas as gpd
 from pathlib import Path
 from shapely.geometry import LineString
 from scgraph.geographs.marnet import marnet_geograph
+import json
 
 # Database path relative to this module's location
 DB_PATH = str(Path(__file__).resolve().parent / 'database.duckdb')
@@ -139,7 +144,7 @@ def etl_climate_trace(file_path_climate_trace):
     """ETL process for Climate TRACE data: Extract, Transform, Load."""
     # Import all Climate TRACE csv file in the folder
     climate_trace = glob.glob(file_path_climate_trace + "/*.csv")
-    climate_trace = pd.concat((pd.read_csv(file, low_memory=False) for file in climate_trace), ignore_index=True)
+    climate_trace = pd.concat((pd.read_csv(file, low_memory=False, encoding='utf-8') for file in climate_trace), ignore_index=True)
     
     ### Transformation ###
     # Rename columns
@@ -211,7 +216,7 @@ def etl_co2_storage(file_path_co2_storage):
 def etl_port(file_path_port):
     """ETL process for port data: Extract, Transform, Load."""
     # Import port excel file in raw folder
-    port = pd.read_csv(file_path_port)
+    port = pd.read_csv(file_path_port, encoding='utf-8')
     
     ### Transformation ###
     # Rename columns
@@ -350,7 +355,7 @@ def select_ports():
 
 
 ############# 3. Combines all seleted emiiters, storage, and ports data #####################
-def combine_all_selected():
+def combine_all_selected(output_path):
     """Combine all selected emitters, storage, and ports data into one table"""
     con = duckdb.connect(DB_PATH)
     query = """
@@ -405,6 +410,11 @@ def combine_all_selected():
     con.execute("CREATE OR REPLACE TABLE combined_selected AS SELECT * FROM combined_selected")
     con.close()
 
+    return combined_selected
+
+    # Export combined_selected to excel for manual checking
+    combined_selected.to_excel(Path(output_path) / 'combined_selected.xlsx', index=False)
+
 ############# 4. Create ship route data for selected ports #####################
 def create_ship_routes(output_path):
     con = duckdb.connect(DB_PATH)
@@ -452,9 +462,8 @@ def create_ship_routes(output_path):
     # Prepare final table
     ship_routes = routes_df[['route_id', 'from', 'to', 'distance_km', 'geometry_wkt']].rename(
         columns={'from': 'from_port', 'to': 'to_port'})
-    # Export to 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    ship_routes.to_excel(output_path, index=False)
+    # Export to excel for manual checking
+    ship_routes.to_excel(Path(output_path) / 'ship_routes.xlsx', index=False)
     
     # Load into database
     con.register('ship_routes', ship_routes)
@@ -730,23 +739,29 @@ def create_pipeline_network(output_path):
     # Make sure all distance_km are numeric
     pipeline_network['distance_km'] = pd.to_numeric(pipeline_network['distance_km'], errors='coerce')
 
-    # Fill 0 for 'from_name' == 'to_name'
+    # Fill 0.000001 for 'from_name' == 'to_name'
     same_name_mask = pipeline_network["from_name"] == pipeline_network["to_name"]
-    pipeline_network.loc[same_name_mask, "distance_km"] = 0.0
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    pipeline_network.to_excel(output_path, index=False)
+    pipeline_network.loc[same_name_mask, "distance_km"] = 0.000001
+    # Export to excel for manual checking
+    pipeline_network.to_excel(Path(output_path) / 'pipeline_network.xlsx', index=False)
 
     con.register('pipeline_network', pipeline_network)
     con.execute("CREATE OR REPLACE TABLE pipeline_network AS SELECT * FROM pipeline_network")
     con.close()
 
-    return pipeline_network
-
 
 
 ############# 6. Create reusable N x N matrix from database table #####################
+
 def create_matrix(table_name, col_start, col_end, value, output_path):
+    """ 
+    Create a square matrix (DataFrame) from a database table
+    table_name : Name of the database table to query.
+    col_start : Name of the column to use for the matrix row indices.
+    col_end : Name of the column to use for the matrix column indices.
+    value : Name of the column to use for the matrix cell values.
+    output_path : Path to save the resulting CSV file.
+    """
     # Quote identifiers so custom table/column names work safely.
     def _q(identifier):
         return '"' + str(identifier).replace('"', '""') + '"'
@@ -772,46 +787,179 @@ def create_matrix(table_name, col_start, col_end, value, output_path):
     # Fill the matrix with values from the data; missing entries will remain NaN for now.
     for row in data.itertuples(index=False):
         matrix.at[row.node_start, row.node_end] = row.cell_value
-    # Set diagonal to 0 (distance from a node to itself is zero); this also ensures any nodes that only appear as start or end are included in the matrix.
-    for node in nodes:
-        matrix.at[node, node] = 0
+
     # Fill any remaining NaN values with 0
     matrix = matrix.fillna(0)
 
     # Ensure all matrix values are numeric
     matrix = matrix.astype(float)
 
+    # Ensure index and columns are string type to preserve Unicode
+    matrix.index = matrix.index.astype(str)
+    matrix.columns = matrix.columns.astype(str)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    matrix.to_csv(output_path, index_label="NODE")
+    matrix.to_csv(output_path, index_label="NODE", encoding='utf-8')
 
     return matrix
 
 
+
 ############# 7. Create NodeLocations.csv from combined_selected #####################
-def create_node_location(type, altitude):
+def create_node_location(type, altitude, path_model_input):
     con = duckdb.connect(DB_PATH)
     nodes = con.execute("SELECT name, type, longitude, latitude FROM combined_selected").fetchdf()
     con.close()
 
-    # Support one type (e.g., 'port') or multiple types (e.g., ['port', 'storage']).
-    if isinstance(type, (list, tuple, set)):
-        selected = nodes[nodes['type'].isin(type)]
-    else:
-        selected = nodes[nodes['type'].astype(str).str.contains(str(type), case=False, na=False)]
+    selected = nodes[nodes['type'].isin(type)]
 
-    node_locations = selected[['name', 'longitude', 'latitude']]
+    node_locations = selected[['name', 'longitude', 'latitude']].copy()
     node_locations.rename(columns={'longitude': 'lon', 'latitude': 'lat'}, inplace=True)
     node_locations['alt'] = altitude
-    node_locations = node_locations.drop_duplicates(subset=['name'])
+    
+    # Handle duplicates by keeping the row with valid (non-NULL) coordinates.
+    # If all duplicates have the same coordinates, just keep the first.
+    node_locations = node_locations.drop_duplicates(subset=['name'], keep='first')
+    
     node_locations = node_locations.set_index('name')
 
-    output_path = Path(__file__).resolve().parent / 'inputs' / 'NodeLocations.csv'
+    output_path = path_model_input / 'NodeLocations.csv'
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Match expected model format: ;lon;lat;alt with node names in first column.
-    node_locations.to_csv(output_path, sep=';', index=True, index_label='')
+    # QUOTE_NONNUMERIC wraps string index values (node names) in quotes so names
+    # containing commas are not mis-split by comma-aware viewers (e.g. Excel).
+    node_locations.to_csv(output_path, sep=';', index=True, index_label='',
+                          encoding='utf-8', quoting=csv.QUOTE_NONNUMERIC)
 
-    return node_locations
 
+
+
+
+
+
+############# 8. Copy technology JSON files from adopt-net0 database  #####################
+def copy_technology_from_db(technology_list, output_path):
+    """
+    Copy technology JSON files from the adopt_net0 database to a destination folder.
+    technology_list : list of names of technologies to copy. The name must match the JSON filename (without .json extension).
+    output_path : Folder where the JSON files will be copied to.
+    """
+    import shutil
+
+    # The adopt_net0 template library is expected to be located at:
+    template_root = Path(__file__).resolve().parent.parent / 'adopt_net0' / 'database' / 'templates' / 'technology_data'
+    output_path = Path(output_path)
+    # Create the output directory if it doesn't exist
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Build a lookup of available template files by their filename.
+    available = {p.stem: p for p in template_root.rglob('*.json')}
+
+    # For each technology name in the input list, check if a corresponding JSON file exists in the template library and copy it to the output folder.
+    for name in technology_list:
+        if name in available:
+            src = available[name]
+            shutil.copy2(src, output_path / src.name)
+            print(f"Copied: {src.name}  -->  {output_path}")
+
+
+
+
+
+
+
+############# 9. Create emitter technology JSON files for industrial sectors #####################
+def create_emitter_technology(input_path, output_path):
+    """Create emitter technology JSON files from Excel config."""
+    
+    destination_folder = Path(output_path)
+    df = pd.read_excel(input_path).dropna(how="all")
+
+    # Iterate through each row of the DataFrame and create a JSON file for each technology configuration.
+    # The JSON structure is based on the expected format for technology data in the adopt_net0.
+    for row in df.to_dict("records"):
+
+        data = {
+            "tec_type": row["tec_type"],
+            "comment": "This file is auto-generated from user input in excel file.",
+            "size_min": 0,
+            "size_max": row["size_max"],
+            "size_is_int": 0,   
+            "size_based_on": "output",
+            "decommission": 0,
+            "Economics": {
+                "capex_model": 1,
+                "unit_capex": 0,
+                "opex_variable": 0,
+                "opex_fixed": 0,
+                "discount_rate": row["discount_rate"],
+                "lifetime": int(row["lifetime"]),
+                "decommission_cost": 0,
+            },
+            "Performance": {
+                "performance_function_type": 1,
+                "main_output_carrier": row["main_output_carrier"],
+                "output_carrier": [row["output_carrier"]],
+                "output_ratios": {},
+                "emission_factor": row["emission_factor"],
+                "min_part_load": 0,
+                "ccs": {
+                    "possible": 1,
+                    "co2_concentration": row["co2_concentration"],
+                    "ccs_type": "MEA_large",
+                },
+                "ramping_rate": -1,
+                "standby_power": -1,
+                "min_uptime": -1,
+                "min_downtime": -1,
+                "SU_time": -1,
+                "SD_time": -1,
+                "SU_load": -1,
+                "SD_load": -1,
+                "max_startups": -1,
+            },
+            "Units": {
+                "size": "t/h",
+                "output_carrier": {"CO2captured": "t/h"},
+            },
+        }
+
+        filename = Path(row["filename"]).with_suffix(".json")
+        output_file = destination_folder / filename
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+        print(f"Created: {output_file}")
+
+
+
+
+
+############# 10. Copy network data JSON files from adopt_net0 database #####################
+def copy_network_data_from_db(network_data_list, output_path):
+    """
+    Copy network data JSON files from the adopt_net0 database to a destination folder.
+    network_data_list : list of names of network data files to copy. The name must match the JSON filename (without .json extension).
+    output_path : Folder where the JSON files will be copied to.
+    """
+    import shutil
+
+    # The adopt_net0 template library is expected to be located at:
+    template_root = Path(__file__).resolve().parent.parent / 'adopt_net0' / 'database' / 'templates' / 'network_data'
+    output_path = Path(output_path)
+    # Create the output directory if it doesn't exist
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Build a lookup of available template files by their filename.
+    available = {p.stem: p for p in template_root.rglob('*.json')}
+
+    # For each network data name in the input list, check if a corresponding JSON file exists in the template library and copy it to the output folder.
+    for name in network_data_list:
+        if name in available:
+            src = available[name]
+            shutil.copy2(src, output_path / src.name)
+            print(f"Copied: {src.name}  -->  {output_path}")
 
 
 

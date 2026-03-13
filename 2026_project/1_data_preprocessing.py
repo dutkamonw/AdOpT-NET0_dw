@@ -10,6 +10,9 @@
 
 from pathlib import Path
 from user_defined_function import create_pipeline_network, etl_eea, etl_climate_trace, combine_emitters, etl_co2_storage, etl_port, select_emitters, select_co2_storage, select_ports, combine_all_selected, create_ship_routes, create_pipeline_network
+import duckdb
+
+
 
 ################### Define file paths and filter parameters ###################
 
@@ -17,18 +20,25 @@ from user_defined_function import create_pipeline_network, etl_eea, etl_climate_
 script_dir = Path(__file__).resolve().parent
 
 ## ----- Define file path -----
-raw_dir = script_dir / 'raw'
+raw_dir = script_dir / '1_raw'
 file_path_eea = str(raw_dir / 'EEA_CO2.xlsx')         # raw excel file (query from Industrial_dataset_v_15_2025_12_15.DB)
 file_path_climate_trace = str(raw_dir / 'climate_trace')   # folder with multiple raw csv files
 file_path_co2_storage = str(raw_dir / 'storage.xlsx')           # manual create excel file
 file_path_port = str(raw_dir / 'port.csv')                      # editted csv file from World Port Index
 file_path_area = str(raw_dir / 'Area_Boundary.geojson')         # manual create geojson file
-output_path_intermediate_result = str(script_dir / 'data_processed' / 'intermediate_output' / 'pipeline_network.xlsx')    #  export for manual checking
+db_path = script_dir / 'database.duckdb'
+
+output_path_intermediate_result = str(script_dir / '2_data_processed' / 'intermediate_output')    #  export for manual checking
+
+# Create intermediate_output folder if it doesn't exist
+Path(output_path_intermediate_result).mkdir(parents=True, exist_ok=True)
 
 ## ----- Define filter parameters -----
 selected_subsectors = ['steel', 'cement', 'waste']
 emission_cutoff = 200000   # tCO2 per year
 storage_cutoff = 15000000  # tCO2 
+
+
 
 
 
@@ -46,7 +56,9 @@ select_co2_storage(file_path_area, storage_cutoff)
 select_ports()
 
 ## ----- 3) Combine all selected data into one table -----
-combine_all_selected()
+combined_selected = combine_all_selected(output_path_intermediate_result)
+# Export combined_selected to excel for manual checking
+combined_selected.to_excel(Path(output_path_intermediate_result) / 'combined_selected.xlsx', index=False)
 
 ## ----- 4)  Create ship routes data using SCGraph ------
 create_ship_routes(output_path_intermediate_result)
@@ -55,9 +67,8 @@ create_ship_routes(output_path_intermediate_result)
 create_pipeline_network(output_path_intermediate_result)
 
 # Print the table name from database.duckdb
-import duckdb
-db_path = script_dir / 'database.duckdb'
 con = duckdb.connect(str(db_path))
+print("Created tables in duckdb:")
 tables = con.execute("SHOW TABLES").fetchall()
 print(tables)
 con.close()

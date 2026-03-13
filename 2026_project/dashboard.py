@@ -275,7 +275,7 @@ else:
     )
 
 st.sidebar.markdown("**Port:**")
-port_size = st.sidebar.slider("Port Triangle Size (meters)", min_value=5000, max_value=20000, value=5000, step=500)
+port_size = st.sidebar.slider("Port Triangle Size (meters)", min_value=500, max_value=20000, value=5000, step=500)
 
 # Layer visibility controls
 st.sidebar.subheader("Show/Hide Layers")
